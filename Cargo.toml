@@ -1,7 +1,7 @@
 [package]
 edition = "2021"
 name = "ipdb-rust"
-version = "0.1.1"
+version = "0.1.2"
 
 description = "Library for reading IPIP.net's IPDB database files"
 include = ["/Cargo.toml", "/benches/*.rs", "/src/**/*.rs", "/README.md", "/LICENSE"]

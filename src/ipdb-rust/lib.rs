@@ -339,7 +339,7 @@ impl<'de, S: AsRef<[u8]>> Reader<S> {
     }
 }
 
-mod city;
+pub mod city;
 
 #[inline]
 fn ip_to_bytes(address: IpAddr) -> Vec<u8> {
