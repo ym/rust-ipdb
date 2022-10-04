@@ -1,11 +1,14 @@
+use std::cmp::Ordering;
 use std::fmt::{self, Display, Formatter};
 use std::io;
+use std::marker::PhantomData;
 use std::str;
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
+use ipnetwork::IpNetwork;
 use serde::{de, Deserialize};
 use serde_json;
 
@@ -34,6 +37,7 @@ pub enum IPDBError {
     NotSupportedError(String),
 
     DataNotFoundError(String),
+    InvalidNetworkError(String),
 }
 
 impl From<io::Error> for IPDBError {
@@ -56,6 +60,8 @@ impl Display for IPDBError {
             IPDBError::IPFormatError(msg) => write!(fmt, "IPFormatError: {}", msg)?,
             IPDBError::NotSupportedError(msg) => write!(fmt, "NotSupportedError: {}", msg)?,
             IPDBError::DataNotFoundError(msg) => write!(fmt, "DataNotFoundError: {}", msg)?,
+
+            IPDBError::InvalidNetworkError(msg) => write!(fmt, "InvalidNetworkError: {}", msg)?,
         }
         Ok(())
     }
@@ -300,7 +306,7 @@ impl<'de, S: AsRef<[u8]>> Reader<S> {
         &self,
         address: IpAddr,
         language: String,
-    ) -> Result<(city::CityInfo, usize), IPDBError> {
+    ) -> Result<(CityInfo, usize), IPDBError> {
         // check if language is supported
         let skip = match self.meta.languages.get(&language) {
             Some(x) => x,
@@ -337,6 +343,150 @@ impl<'de, S: AsRef<[u8]>> Reader<S> {
 
         Ok((data, prefix_len))
     }
+
+    pub fn within(&'de self, cidr: IpNetwork) -> Result<Within<S>, IPDBError>
+    {
+        let ip_address = cidr.network();
+        let prefix_len = cidr.prefix() as usize;
+        let ip_bytes = ip_to_bytes(ip_address);
+        let bit_count = ip_bytes.len() * 8;
+
+        // IPv6 isn't implemented yet
+        let mut node = self.ipv4_offset;
+        let node_count = self.meta.node_count as usize;
+
+        let mut stack: Vec<WithinNode> = Vec::with_capacity(bit_count - prefix_len);
+
+        // Traverse down the tree to the level that matches the cidr mark
+        let mut i = 0_usize;
+        while i < prefix_len {
+            let bit = 1 & (ip_bytes[i >> 3] >> (7 - (i % 8))) as usize;
+            node = self.read_node(node, bit)?;
+            if node >= node_count {
+                // We've hit a dead end before we exhausted our prefix
+                break;
+            }
+
+            i += 1;
+        }
+
+        if node < node_count {
+            // Ok, now anything that's below node in the tree is "within", start with the node we
+            // traversed to as our to be processed stack.
+            stack.push(WithinNode {
+                node,
+                ip_bytes,
+                prefix_len,
+            });
+        }
+        // else the stack will be empty and we'll be returning an iterator that visits nothing,
+        // which makes sense.
+
+        let within: Within<S> = Within {
+            reader: self,
+            node_count,
+            stack,
+            phantom: PhantomData,
+        };
+
+        Ok(within)
+    }
+
+}
+
+#[derive(Debug)]
+struct WithinNode {
+    node: usize,
+    ip_bytes: Vec<u8>,
+    prefix_len: usize,
+}
+
+#[derive(Debug)]
+pub struct Within<'de, S: AsRef<[u8]>> {
+    reader: &'de Reader<S>,
+    node_count: usize,
+    stack: Vec<WithinNode>,
+    phantom: PhantomData<CityInfo<'de>>,
+}
+
+#[derive(Debug)]
+pub struct WithinItem<'a> {
+    pub ip_net: IpNetwork,
+    pub info:CityInfo<'a>,
+}
+
+impl<'de, S: AsRef<[u8]>> Iterator for Within<'de, S> {
+    type Item = Result<WithinItem<'de>, IPDBError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.stack.is_empty() {
+            let current = self.stack.pop().unwrap();
+            let bit_count = current.ip_bytes.len() * 8;
+
+            // Skip networks that are aliases for the IPv4 network
+            if self.reader.ipv4_offset != 0
+                && current.node == self.reader.ipv4_offset
+                && bit_count == 128
+                && current.ip_bytes[..12].iter().any(|&b| b != 0)
+            {
+                continue;
+            }
+
+            match current.node.cmp(&self.node_count) {
+                Ordering::Greater => {
+                    // This is a data node, emit it and we're done (until the following next call)
+                    let ip_net = match bytes_and_prefix_to_net(
+                        &current.ip_bytes,
+                        current.prefix_len as u8,
+                    ) {
+                        Ok(ip_net) => ip_net,
+                        Err(e) => return Some(Err(e)),
+                    };
+
+                    let rec = match self.reader.resolve_data_pointer(current.node) {
+                        Ok(rec) => rec,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    
+                    let data = self.reader.parse_data(rec.0, rec.1, 0);
+                    return match data {
+                        Ok(info) => Some(Ok(WithinItem { ip_net, info })),
+                        Err(e) => Some(Err(e)),
+                    };
+                }
+                Ordering::Equal => {
+                    // Dead end, nothing to do
+                }
+                Ordering::Less => {
+                    // In order traversal of our children
+                    // right/1-bit
+                    let mut right_ip_bytes = current.ip_bytes.clone();
+                    right_ip_bytes[current.prefix_len >> 3] |=
+                        1 << ((bit_count - current.prefix_len - 1) % 8);
+                    let node = match self.reader.read_node(current.node, 1) {
+                        Ok(node) => node,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    self.stack.push(WithinNode {
+                        node,
+                        ip_bytes: right_ip_bytes,
+                        prefix_len: current.prefix_len + 1,
+                    });
+                    // left/0-bit
+                    let node = match self.reader.read_node(current.node, 0) {
+                        Ok(node) => node,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    self.stack.push(WithinNode {
+                        node,
+                        ip_bytes: current.ip_bytes.clone(),
+                        prefix_len: current.prefix_len + 1,
+                    });
+                }
+            }
+        }
+        None
+    }
 }
 
 pub mod city;
@@ -347,4 +497,49 @@ fn ip_to_bytes(address: IpAddr) -> Vec<u8> {
         IpAddr::V4(a) => a.octets().to_vec(),
         IpAddr::V6(a) => a.octets().to_vec(),
     }
+}
+
+#[allow(clippy::many_single_char_names)]
+fn bytes_and_prefix_to_net(bytes: &[u8], prefix: u8) -> Result<IpNetwork, IPDBError> {
+    let (ip, pre) = match bytes.len() {
+        4 => (
+            IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])),
+            prefix,
+        ),
+        16 => {
+            if bytes[0] == 0
+                && bytes[1] == 0
+                && bytes[2] == 0
+                && bytes[3] == 0
+                && bytes[4] == 0
+                && bytes[5] == 0
+                && bytes[6] == 0
+                && bytes[7] == 0
+                && bytes[8] == 0
+                && bytes[9] == 0
+                && bytes[10] == 0
+                && bytes[11] == 0
+            {
+                // It's actually v4, but in v6 form, convert would be nice if ipnetwork had this
+                // logic.
+                (
+                    IpAddr::V4(Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15])),
+                    prefix - 96,
+                )
+            } else {
+                let a = (bytes[0] as u16) << 8 | bytes[1] as u16;
+                let b = (bytes[2] as u16) << 8 | bytes[3] as u16;
+                let c = (bytes[4] as u16) << 8 | bytes[5] as u16;
+                let d = (bytes[6] as u16) << 8 | bytes[7] as u16;
+                let e = (bytes[8] as u16) << 8 | bytes[9] as u16;
+                let f = (bytes[10] as u16) << 8 | bytes[11] as u16;
+                let g = (bytes[12] as u16) << 8 | bytes[13] as u16;
+                let h = (bytes[14] as u16) << 8 | bytes[15] as u16;
+                (IpAddr::V6(Ipv6Addr::new(a, b, c, d, e, f, g, h)), prefix)
+            }
+        }
+        // This should never happen
+        _ => return Err(IPDBError::InvalidNetworkError("invalid address".to_owned())),
+    };
+    IpNetwork::new(ip, pre).map_err(|e| IPDBError::InvalidNetworkError(e.to_string()))
 }
